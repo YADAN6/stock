@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K线形态识别 + 大级别波浪自动绘制</title>
+    <style>
+        * {margin: 0; padding: 0; box-sizing: border-box; font-family: "Microsoft Yahei", sans-serif;}
+        body {background: #0f1722; color: #e5e7eb; padding: 10px;}
+        .container {max-width: 1400px; margin: 0 auto;}
+        .top-bar {display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;}
+        .info {font-size: 14px; color: #9ca3af;}
+        .level-tip {color: #facc15; font-weight: bold;}
+        canvas {border: 1px solid #374151; background: #0b1118; cursor: crosshair;}
+        .log-box {margin-top: 10px; padding: 10px; background: #111827; border: 1px solid #374151; height: 180px; overflow-y: auto; font-size: 13px; line-height: 1.6;}
+        .btn {padding: 6px 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer;}
+        .btn:hover {background: #1d4ed8;}
+        .btn.active {background: #64748b;}
+        .btn.wave {background: #9333ea;}
+        .btn.wave:hover {background: #7e22ce;}
+        .btn.auto-wave {background: #059669;}
+        .btn.auto-wave:hover {background: #047857;}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="top-bar">
+            <div class="info">均线：5/10/30/55/233 | <span class="level-tip">大级别形态优先识别</span></div>
+            <button class="btn" id="reGenData">重新生成K线</button>
+            <button class="btn" id="clearMark">清除形态标记</button>
+            <button class="btn" id="toggleMA">隐藏均线</button>
+            <button class="btn wave" id="startWave">开启手动波浪</button>
+            <button class="btn wave" id="clearWave">清除波浪</button>
+            <button class="btn auto-wave" id="autoWave">自动识别大级别浪</button>
+        </div>
+        <canvas id="klineCanvas" width="1380" height="500"></canvas>
+        <div class="log-box" id="logBox">识别日志：<br></div>
+    </div>
+
+    <script>
+        const MA_PERIODS = [5, 10, 30, 55, 233];
+        const LEVEL_NAME = {5: '5日线', 10: '10日线', 30: '30日线', 55: '55日线', 233: '233日线'};
+        const maColor = {5:'#fbbf24',10:'#38bdf8',30:'#a855f7',55:'#fb923c',233:'#ec4899'};
+
+        let canvas = document.getElementById('klineCanvas');
+        let ctx = canvas.getContext('2d');
+        let logBox = document.getElementById('logBox');
+
+        let klineData = [];
+        let maData = {};
+        let shapeMarks = [];
+        let highestTriggerLevel = 0;
+        let isMAShow = true;
+
+        let isWaveDraw = false;
+        let wavePoints = [];
+        let isMouseDown = false;
+        let tempPoint = null;
+
+        let autoWavePoints = [];
+        const waveLabel = ['1','2','3','4','5']; // 仅标注 1~5 推动浪，取消abc调整浪
+
+        function log(text) {
+            logBox.innerHTML += text + '<br>';
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        // 恢复：纯随机K线
+        function generateKline(count = 350) {
+            klineData = [];
+            let basePrice = 20;
+            for (let i = 0; i < count; i++) {
+                let fluct = (Math.random() - 0.5) * 1.2;
+                let open = basePrice + fluct;
+                let close = open + (Math.random() - 0.5) * 0.8;
+                let high = Math.max(open, close) + Math.random() * 0.5;
+                let low = Math.min(open, close) - Math.random() * 0.5;
+                klineData.push({open, close, high, low});
+                basePrice = close;
+            }
+            calcMA();
+            shapeMarks = [];
+            wavePoints = [];
+            autoWavePoints = [];
+            highestTriggerLevel = 0;
+            log('✅ 已生成随机K线数据');
+            drawAll();
+        }
+
+        function calcMA() {
+            MA_PERIODS.forEach(period => {
+                let maArr = [];
+                for (let i = 0; i < klineData.length; i++) {
+                    if (i < period - 1) {
+                        maArr.push(null);
+                        continue;
+                    }
+                    let sum = 0;
+                    for (let j = 0; j < period; j++) {
+                        sum += klineData[i - j].close;
+                    }
+                    maArr.push(Number((sum / period).toFixed(2)));
+                }
+                maData[period] = maArr;
+            });
+        }
+
+        function drawKline() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const kWidth = 4;
+            const kGap = 2;
+            const viewCount = Math.floor(canvas.width / (kWidth + kGap));
+            const startIdx = Math.max(0, klineData.length - viewCount);
+            const data = klineData.slice(startIdx);
+
+            let maxPrice = -Infinity, minPrice = Infinity;
+            data.forEach(d => {
+                maxPrice = Math.max(maxPrice, d.high);
+                minPrice = Math.min(minPrice, d.low);
+            });
+            const priceRange = maxPrice - minPrice || 1;
+            const chartH = canvas.height - 40;
+            const price2Y = (price) => 30 + chartH * (1 - (price - minPrice) / priceRange);
+
+            window._chartConfig = { startIdx, kWidth, kGap, price2Y };
+
+            data.forEach((d, idx) => {
+                const x = idx * (kWidth + kGap);
+                const isRed = d.close >= d.open;
+                ctx.strokeStyle = isRed ? '#ef4444' : '#22c55e';
+                ctx.fillStyle = isRed ? '#ef4444' : '#22c55e';
+
+                ctx.beginPath();
+                ctx.moveTo(x + kWidth/2, price2Y(d.high));
+                ctx.lineTo(x + kWidth/2, price2Y(d.low));
+                ctx.stroke();
+
+                const oY = price2Y(d.open);
+                const cY = price2Y(d.close);
+                ctx.fillRect(x, Math.min(oY, cY), kWidth, Math.abs(cY - oY));
+            });
+
+            if (isMAShow) {
+                MA_PERIODS.forEach(period => {
+                    const maArr = maData[period];
+                    ctx.strokeStyle = maColor[period];
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    let hasStart = false;
+                    for (let i = 0; i < data.length; i++) {
+                        const realIdx = startIdx + i;
+                        const val = maArr[realIdx];
+                        if (!val) continue;
+                        const x = i * (kWidth + kGap) + kWidth/2;
+                        const y = price2Y(val);
+                        if (!hasStart) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                        hasStart = true;
+                    }
+                    ctx.stroke();
+                });
+            }
+            return window._chartConfig;
+        }
+
+        function drawMarks(drawCfg) {
+            const {startIdx, kWidth, kGap, price2Y} = drawCfg;
+            shapeMarks.forEach(mark => {
+                ctx.strokeStyle = mark.color;
+                ctx.fillStyle = mark.color;
+                ctx.lineWidth = 2;
+                mark.points.forEach(p => {
+                    const idx = p.idx - startIdx;
+                    if (idx < 0) return;
+                    const x = idx * (kWidth + kGap) + kWidth/2;
+                    const y = price2Y(p.price);
+                    ctx.beginPath();
+                    ctx.arc(x, y, 5, 0, Math.PI*2);
+                    ctx.stroke();
+                });
+                const lastP = mark.points[mark.points.length-1];
+                const txtX = (lastP.idx - startIdx) * (kWidth + kGap);
+                const txtY = price2Y(lastP.price) - 15;
+                ctx.font = "12px Microsoft Yahei";
+                ctx.fillText(mark.name, txtX, txtY);
+            });
+        }
+
+        function drawWaveLine() {
+            if (wavePoints.length < 2) return;
+            ctx.strokeStyle = '#facc15';
+            ctx.fillStyle = '#facc15';
+            ctx.lineWidth = 2;
+            ctx.font = "14px Microsoft Yahei";
+
+            ctx.beginPath();
+            ctx.moveTo(wavePoints[0].x, wavePoints[0].y);
+            for(let i = 1; i < wavePoints.length; i++){
+                ctx.lineTo(wavePoints[i].x, wavePoints[i].y);
+            }
+            ctx.stroke();
+
+            wavePoints.forEach((p, idx) => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                ctx.fill();
+                let text = waveLabel[idx % waveLabel.length];
+                ctx.fillText(text, p.x + 6, p.y - 6);
+            });
+
+            if(isMouseDown && tempPoint){
+                ctx.strokeStyle = 'rgba(250, 204, 21, 0.5)';
+                ctx.setLineDash([4,4]);
+                ctx.beginPath();
+                ctx.moveTo(wavePoints[wavePoints.length-1].x, wavePoints[wavePoints.length-1].y);
+                ctx.lineTo(tempPoint.x, tempPoint.y);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+
+        // 大级别波浪识别：只抓大拐点，不要求完整5浪，随机K线也可识别
+        function autoDetectWave() {
+            autoWavePoints = [];
+            const data = klineData;
+            const len = data.length;
+            const bigWindow = 14; // 大窗口 = 只识别【大级别高低点】，过滤小震荡
+
+            // 提取所有大级别局部高低拐点
+            let pivots = [];
+            for (let i = bigWindow; i < len - bigWindow; i++) {
+                let isHigh = true;
+                let isLow = true;
+                for (let j = i - bigWindow; j <= i + bigWindow; j++) {
+                    if (data[i].high < data[j].high) isHigh = false;
+                    if (data[i].low > data[j].low) isLow = false;
+                }
+                if (isHigh || isLow) {
+                    pivots.push({
+                        idx: i,
+                        price: isHigh ? data[i].high : data[i].low,
+                        type: isHigh ? 'high' : 'low'
+                    });
+                }
+            }
+
+            if (pivots.length < 3) {
+                log('ℹ️ 暂未识别到足够大级别拐点，可重新生成K线重试');
+                drawAll();
+                return;
+            }
+
+            // 取后半段拐点，最多取5个（对应1~5浪），不强制凑数
+            let targetPivots = pivots.slice(-5);
+
+            const {startIdx, kWidth, kGap, price2Y} = window._chartConfig;
+            targetPivots.forEach(p => {
+                const viewIdx = p.idx - startIdx;
+                const x = viewIdx * (kWidth + kGap) + kWidth / 2;
+                const y = price2Y(p.price);
+                autoWavePoints.push({x, y});
+            });
+
+            log(`🌊 识别到 ${autoWavePoints.length} 个大级别浪拐点，已自动绘制`);
+            drawAll();
+        }
+
+        // 绘制自动大级别波浪（蓝色线条）
+        function drawAutoWave() {
+            if (autoWavePoints.length < 2) return;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.fillStyle = '#38bdf8';
+            ctx.lineWidth = 2.5;
+            ctx.font = "14px Microsoft Yahei";
+
+            ctx.beginPath();
+            ctx.moveTo(autoWavePoints[0].x, autoWavePoints[0].y);
+            for(let i = 1; i < autoWavePoints.length; i++){
+                ctx.lineTo(autoWavePoints[i].x, autoWavePoints[i].y);
+            }
+            ctx.stroke();
+
+            // 依次标注 1/2/3/4/5
+            autoWavePoints.forEach((p, idx) => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+                ctx.fill();
+                if(idx < waveLabel.length){
+                    ctx.fillText(waveLabel[idx], p.x + 6, p.y - 6);
+                }
+            });
+        }
+
+        function drawAll() {
+            const cfg = drawKline();
+            drawMarks(cfg);
+            drawWaveLine();
+            drawAutoWave();
+        }
+
+        // 原有形态识别逻辑不变
+        function detectShape() {
+            shapeMarks = [];
+            highestTriggerLevel = 0;
+            log('\n---------- 开始形态识别 ----------');
+            const sortLevels = [...MA_PERIODS].sort((a,b)=>b-a);
+
+            for (const level of sortLevels) {
+                if (highestTriggerLevel > 0) {
+                    log(`⚠️ 已识别大级别形态(${LEVEL_NAME[highestTriggerLevel]})，跳过 ${LEVEL_NAME[level]}`);
+                    continue;
+                }
+                const maArr = maData[level];
+                const res = checkBaseShape(klineData, maArr, level);
+                if (res.length > 0) {
+                    highestTriggerLevel = level;
+                    log(`🎉 ${LEVEL_NAME[level]} 识别到形态`);
+                    shapeMarks.push(...res);
+                } else {
+                    log(`ℹ️ ${LEVEL_NAME[level]} 无形态`);
+                }
+            }
+            log('---------- 识别结束 ----------');
+            drawAll();
+        }
+
+        function checkBaseShape(kData, maArr, level) {
+            const marks = [];
+            const len = kData.length;
+            const lookBack = Math.floor(level / 2);
+
+            for (let i = lookBack; i < len - 3; i++) {
+                const m = maArr[i];
+                if (!m) continue;
+                const p0 = kData[i-2], p1 = kData[i-1], p2 = kData[i], p3 = kData[i+1], p4 = kData[i+2];
+                if (p2.low < p1.low && p2.low < p3.low && p1.low < p0.low && p3.low < p4.low && p2.close > m) {
+                    marks.push({name: '底分型', color: '#22c55e', points: [{idx:i, price:p2.low}]});
+                    break;
+                }
+            }
+            for (let i = lookBack; i < len - 3; i++) {
+                const m = maArr[i];
+                if (!m) continue;
+                const p0 = kData[i-2], p1 = kData[i-1], p2 = kData[i], p3 = kData[i+1], p4 = kData[i+2];
+                if (p2.high > p1.high && p2.high > p3.high && p1.high > p0.high && p3.high > p4.high && p2.close < m) {
+                    marks.push({name: '顶分型', color: '#ef4444', points: [{idx:i, price:p2.high}]});
+                    break;
+                }
+            }
+            for (let i = lookBack + 10; i < len - 5; i++) {
+                const l = kData[i-10].low, m = kData[i].low, r = kData[i+5].low;
+                if (Math.abs(l - m) / m < 0.03 && Math.abs(m - r) / m < 0.03) {
+                    marks.push({name: '双重底', color: '#10b981', points: [{idx:i-10, price:l},{idx:i, price:m},{idx:i+5, price:r}]});
+                    break;
+                }
+            }
+            for (let i = lookBack + 10; i < len - 5; i++) {
+                const l = kData[i-10].high, m = kData[i].high, r = kData[i+5].high;
+                if (Math.abs(l - m) / m < 0.03 && Math.abs(m - r) / m < 0.03) {
+                    marks.push({name: '双重顶', color: '#f87171', points: [{idx:i-10, price:l},{idx:i, price:m},{idx:i+5, price:r}]});
+                    break;
+                }
+            }
+            return marks;
+        }
+
+        function getCanvasPos(e) {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: e.clientX - rect.left,
+                y: e.clientY - rect.top
+            };
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            if(!isWaveDraw) return;
+            isMouseDown = true;
+            const pos = getCanvasPos(e);
+            wavePoints.push(pos);
+            log(`🌊 手动新增拐点 (${pos.x.toFixed(0)},${pos.y.toFixed(0)})`);
+            drawAll();
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if(!isWaveDraw || !isMouseDown) return;
+            tempPoint = getCanvasPos(e);
+            drawAll();
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isMouseDown = false;
+            tempPoint = null;
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            isMouseDown = false;
+            tempPoint = null;
+        });
+
+        document.getElementById('toggleMA').addEventListener('click', () => {
+            isMAShow = !isMAShow;
+            const btn = document.getElementById('toggleMA');
+            if (isMAShow) {
+                btn.textContent = '隐藏均线';
+                btn.classList.remove('active');
+                log('📈 显示全部均线');
+            } else {
+                btn.textContent = '显示均线';
+                btn.classList.add('active');
+                log('📉 隐藏全部均线');
+            }
+            drawAll();
+        });
+
+        document.getElementById('reGenData').addEventListener('click', ()=>{
+            generateKline(350);
+            setTimeout(detectShape, 200);
+        });
+
+        document.getElementById('clearMark').addEventListener('click', ()=>{
+            shapeMarks = [];
+            highestTriggerLevel = 0;
+            log('🧹 清除K线形态标记');
+            drawAll();
+        });
+
+        document.getElementById('startWave').addEventListener('click', () => {
+            isWaveDraw = !isWaveDraw;
+            const btn = document.getElementById('startWave');
+            if(isWaveDraw){
+                btn.textContent = '关闭手动波浪';
+                btn.classList.add('active');
+                log('🌊 已开启手动波浪绘图');
+            }else{
+                btn.textContent = '开启手动波浪';
+                log('🌊 已关闭手动波浪绘图');
+            }
+        });
+
+        document.getElementById('clearWave').addEventListener('click', () => {
+            wavePoints = [];
+            autoWavePoints = [];
+            log('🧹 已清除所有波浪线条');
+            drawAll();
+        });
+
+        document.getElementById('autoWave').addEventListener('click', () => {
+            autoDetectWave();
+        });
+
+        window.onload = () => {
+            generateKline(350);
+            setTimeout(detectShape, 200);
+        };
+    </script>
+</body>
+</html>
